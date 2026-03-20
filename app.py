@@ -137,6 +137,9 @@ with st.sidebar:
         available_dates_str = []
     conn.close()
     
+    # Initialize selected_date
+    selected_date = None
+    
     # Convert strings to datetime.date objects for calendar filtering
     available_dates = []
     for d in available_dates_str:
@@ -176,6 +179,54 @@ with st.sidebar:
             st.success(f"已加载 {selected_date} 的数据！")
     else:
         st.warning("数据库中暂无数据，请先上传 Excel 文件。")
+
+    # --- Manual Student Entry ---
+    st.markdown("---")
+    st.subheader("👤 手动添加学生")
+    with st.expander("点击展开添加表单"):
+        with st.form("manual_student_form", clear_on_submit=True):
+            new_class = st.text_input("班级", placeholder="如：一年级一班")
+            new_name = st.text_input("姓名")
+            new_allergen = st.text_input("过敏原", placeholder="如有多个请用逗号隔开")
+            col_h, col_w = st.columns(2)
+            with col_h:
+                new_height = st.number_input("身高 (cm)", min_value=0.0, step=0.1)
+            with col_w:
+                new_weight = st.number_input("体重 (kg)", min_value=0.0, step=0.1)
+            
+            if st.form_submit_button("添加学生"):
+                if new_name and new_class:
+                    conn = sqlite3.connect('canteen.db')
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        INSERT INTO students (class_name, student_name, allergen, height, weight)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (new_class, new_name, new_allergen, new_height, new_weight))
+                    conn.commit()
+                    conn.close()
+                    st.success(f"✅ 学生 {new_name} 已成功添加！")
+                    # Reload students
+                    _, df_students, _ = load_data_from_db()
+                    st.session_state.df_students = df_students
+                    st.rerun()
+                else:
+                    st.error("❌ 姓名和班级为必填项！")
+
+    # --- Student Selection for AI Analysis ---
+    st.markdown("---")
+    st.subheader("🎯 体质分析对象")
+    if st.session_state.df_students is not None and not st.session_state.df_students.empty:
+        student_names = ["全部学生 (普适建议)"] + sorted(st.session_state.df_students['student_name'].tolist())
+        selected_student = st.selectbox(
+            "选择学生进行个性化分析",
+            options=student_names,
+            index=0,
+            help="选中特定学生后，AI 将根据其身高体重提供针对性的饮食建议。"
+        )
+        st.session_state.selected_student = None if selected_student == "全部学生 (普适建议)" else selected_student
+    else:
+        st.info("暂无学生数据，请先上传或手动添加。")
+        st.session_state.selected_student = None
 
     # --- Manual Nutrition Entry ---
     if st.session_state.df_recipes is not None:
@@ -291,22 +342,22 @@ with st.sidebar:
                     conn.close()
                     st.success(f"✅ {selected_ing} 数据已保存！")
                     # Force reload data
-                    df_recipes, df_allergies, df_nutrition = load_data_from_db(selected_date if source_type == "数据库" else None)
+                    df_recipes, df_students, df_nutrition = load_data_from_db(selected_date)
                     st.session_state.df_nutrition = df_nutrition
                     st.rerun()
         else:
             st.success("✨ 所有食材营养数据已补全")
 
-    # Data Preview
-    if st.session_state.df_recipes is not None:
-        st.markdown("---")
-        st.subheader("📊 数据预览")
-        with st.expander("当前菜谱 (Recipes)"):
-            st.dataframe(st.session_state.df_recipes, use_container_width=True)
-        with st.expander("学生信息 (Students)"):
-            st.dataframe(st.session_state.df_students, use_container_width=True)
-        with st.expander("营养库 (Nutrition)"):
-            st.dataframe(st.session_state.df_nutrition, use_container_width=True)
+    # Data Preview (Hidden as requested)
+    # if st.session_state.df_recipes is not None:
+    #     st.markdown("---")
+    #     st.subheader("📊 数据预览")
+    #     with st.expander("当前菜谱 (Recipes)"):
+    #         st.dataframe(st.session_state.df_recipes, use_container_width=True)
+    #     with st.expander("学生信息 (Students)"):
+    #         st.dataframe(st.session_state.df_students, use_container_width=True)
+    #     with st.expander("营养库 (Nutrition)"):
+    #         st.dataframe(st.session_state.df_nutrition, use_container_width=True)
 
 # --- Chat Interface ---
 st.subheader("💬 AI 营养咨询")
@@ -420,7 +471,7 @@ with chat_container:
             我可以帮您：
             1.  **📊 营养分析**：计算对应日期菜谱的热量及各类营养素。
             2.  **⚠️ 过敏检查**：快速识别对某些食材过敏的学生风险。
-            3.  **💡 改进建议**：基于当前营养数据，由 GLM-4 提供专业饮食建议。
+            3.  **💡 改进建议**：基于当前营养数据，由 DOUBAO 提供专业饮食建议。
             4.  **📑 综合分析**：一次性完成上述所有分析并按顺序展示。
             
             您可以直接点击下方的快捷提示或在对话框中输入需求。
@@ -466,12 +517,16 @@ if "pending_prompt" in st.session_state:
             with st.chat_message("assistant"):
                 # Call agent logic from utils
                 with st.spinner("AI 正在分析中..."):
+                    # Get selected student name from session state
+                    selected_student_name = st.session_state.get("selected_student")
+                    
                     result = agent_process(
-                    prompt, 
-                    st.session_state.df_recipes, 
-                    st.session_state.df_students, 
-                    st.session_state.df_nutrition
-                )
+                        prompt, 
+                        st.session_state.df_recipes, 
+                        st.session_state.df_students, 
+                        st.session_state.df_nutrition,
+                        selected_student_name=selected_student_name
+                    )
                 
                 if result.get("type") == "comprehensive":
                     st.subheader("📊 综合营养评估报告")

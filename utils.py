@@ -5,12 +5,15 @@ import plotly.graph_objects as go
 import os
 import time
 from dotenv import load_dotenv
-from zhipuai import ZhipuAI
+from volcenginesdkarkruntime import Ark
 
 load_dotenv()
 
-# Initialize ZhipuAI client
-client = ZhipuAI(api_key=os.getenv("ZHIPUAI_API_KEY"))
+# Initialize Ark client
+client = Ark(
+    base_url='https://ark.cn-beijing.volces.com/api/v3',
+    api_key=os.getenv("ARK_API_KEY")
+)
 
 import re
 
@@ -413,32 +416,48 @@ def check_allergies(df_recipes, df_students):
             "table": risk_table
         }
 
-def get_ai_suggestions(nutrition_summary):
+def get_ai_suggestions(nutrition_summary, dish_details_str="", student_info=None):
+    student_context = ""
+    if student_info:
+        student_context = f"""
+        待分析学生信息：
+        - 姓名：{student_info['student_name']}
+        - 身高：{student_info['height']} cm
+        - 体重：{student_info['weight']} kg
+        
+        请先根据该学生的身高体重进行简单的体质评价（如BMI指数、发育情况等），并结合今日菜谱提供个性化营养建议。
+        重点指出：
+        1. 该学生应该【多吃】哪道菜？（说明原因）
+        2. 该学生应该【少吃】哪道菜？（说明原因）
+        """
+    else:
+        student_context = "请针对整体人群提供普适性的膳食建议。"
+
     prompt = f"""
     你是一位专业的智慧食堂营养师。请根据以下营养分析结果，给出针对性的改进建议。
-    建议字数控制在400字以内，重点从蛋白质多样性、蔬菜种类、脂肪控制、主食粗细搭配等角度出发，确保建议具体可行。
+    建议字数控制在500字以内，重点从蛋白质多样性、蔬菜种类、脂肪控制、主食粗细搭配等角度出发，确保建议具体可行。
 
-    营养分析结果：
+    今日各菜品明细：
+    {dish_details_str}
+
+    当日总营养汇总：
     {nutrition_summary}
+
+    {student_context}
 
     请以专业、亲切的口吻回答。
     """
     
     try:
         # User requested 3-second delay before AI response
-        time.sleep(3)
+        # time.sleep(3) # Removed delay for faster testing, add back if needed
         response = client.chat.completions.create(
-            model="glm-4.7-flash",
+            model="doubao-seed-1-6-lite-251015",
             messages=[
                 {"role": "user", "content": prompt}
             ],
             temperature=1.0,
-            max_tokens=65536,
-            extra_body={
-                "thinking": {
-                    "type": "enabled"
-                }
-            }
+            max_tokens=4096, 
         )
         return {
             "text": f"### 💡 AI 营养师改进建议\n\n{response.choices[0].message.content}",
@@ -452,9 +471,22 @@ def get_ai_suggestions(nutrition_summary):
             "table": None
         }
 
-def agent_process(query, df_recipes, df_students, df_nutrition):
+def agent_process(query, df_recipes, df_students, df_nutrition, selected_student_name=None):
     query = query.lower()
     
+    # Get student info if selected
+    student_info = None
+    if selected_student_name and df_students is not None:
+        student_row = df_students[df_students['student_name'] == selected_student_name]
+        if not student_row.empty:
+            student_info = student_row.iloc[0].to_dict()
+
+    # Get dish details for specific recommendations
+    nut_res_temp = analyze_nutrition(df_recipes, df_nutrition)
+    dish_details_str = ""
+    if nut_res_temp.get("table") is not None:
+        dish_details_str = nut_res_temp["table"].to_string(index=False)
+
     # Check for comprehensive analysis
     if '综合分析' in query:
         # 1. Nutrition Analysis
@@ -464,7 +496,7 @@ def agent_process(query, df_recipes, df_students, df_nutrition):
         allergy_res = check_allergies(df_recipes, df_students)
         
         # 3. AI Suggestions
-        ai_res = get_ai_suggestions(nut_res['text'])
+        ai_res = get_ai_suggestions(nut_res['text'], dish_details_str, student_info)
         
         return {
             "type": "comprehensive",
@@ -482,24 +514,18 @@ def agent_process(query, df_recipes, df_students, df_nutrition):
     
     elif any(k in query for k in ['建议', '改进', '优化', 'suggestion']):
         nut_res = analyze_nutrition(df_recipes, df_nutrition)
-        return get_ai_suggestions(nut_res['text'])
+        return get_ai_suggestions(nut_res['text'], dish_details_str, student_info)
     
     else:
         # Default behavior: try to determine with GLM if it's a general question or just provide nutrition analysis
         prompt = f"用户问：'{query}'。如果这是一个关于食堂菜谱营养、过敏或建议的问题，请直接回答。如果是通用的，请简单介绍你的功能（营养分析、过敏检查、AI改进建议）。"
         try:
-            # User requested 3-second delay before AI response
-            time.sleep(3)
+            # time.sleep(3)
             response = client.chat.completions.create(
-                model="glm-4.7-flash",
+                model="doubao-seed-2-0-lite-260215",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=1.0,
-                max_tokens=65536,
-                extra_body={
-                    "thinking": {
-                        "type": "enabled"
-                    }
-                }
+                max_tokens=4096,
             )
             return {"text": response.choices[0].message.content}
         except Exception as e:
